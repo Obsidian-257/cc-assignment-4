@@ -4,6 +4,7 @@ import logging
 import os
 import re
 from datetime import datetime, timezone
+from functools import lru_cache
 from uuid import uuid4
 
 from azure.cosmos import CosmosClient
@@ -21,59 +22,54 @@ load_dotenv()
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# --------------------------------------------------
-# 1. Configuration
-# --------------------------------------------------
-STORAGE_URL = os.environ["AZURE_STORAGE_ACCOUNT_URL"]
-QUEUE_URL = os.environ["AZURE_QUEUE_ACCOUNT_URL"]
 BLOB_CONTAINER = os.getenv("AZURE_BLOB_CONTAINER", "documents")
 QUEUE_NAME = os.getenv("AZURE_QUEUE_NAME", "document-jobs")
 FAILED_QUEUE_NAME = os.getenv("AZURE_FAILED_QUEUE_NAME", "failed-documents")
-
-COSMOS_ENDPOINT = os.environ["COSMOS_ENDPOINT"]
 COSMOS_DATABASE = os.getenv("COSMOS_DATABASE", "document-pipeline")
 COSMOS_CONTAINER = os.getenv("COSMOS_CONTAINER", "documents")
-
-AI_ENDPOINT = os.environ["AI_ENDPOINT"]
-AI_MODEL = os.environ["AI_MODEL"]
+AI_MODEL = os.getenv("AI_MODEL", "gpt-4.1-mini")
 
 NUM_SHARDS = 64
 MAX_DEQUEUE_ATTEMPTS = 3
 
-# --------------------------------------------------
-# 2. Keyless Entra ID / Managed Identity Clients
-# --------------------------------------------------
-credential = DefaultAzureCredential()
 
-blob_service_client = BlobServiceClient(account_url=STORAGE_URL, credential=credential)
-container_client = blob_service_client.get_container_client(BLOB_CONTAINER)
+@lru_cache(maxsize=1)
+def get_clients():
+    storage_url = os.environ["AZURE_STORAGE_ACCOUNT_URL"]
+    queue_url = os.environ["AZURE_QUEUE_ACCOUNT_URL"]
+    cosmos_endpoint = os.environ["COSMOS_ENDPOINT"]
+    ai_endpoint = os.environ["AI_ENDPOINT"]
 
-jobs_queue_client = QueueClient(
-    account_url=QUEUE_URL, queue_name=QUEUE_NAME, credential=credential
-)
-failed_queue_client = QueueClient(
-    account_url=QUEUE_URL, queue_name=FAILED_QUEUE_NAME, credential=credential
-)
+    credential = DefaultAzureCredential()
 
-cosmos_client = CosmosClient(url=COSMOS_ENDPOINT, credential=credential)
-database_client = cosmos_client.get_database_client(COSMOS_DATABASE)
-cosmos_container_client = database_client.get_container_client(COSMOS_CONTAINER)
+    blob_service = BlobServiceClient(account_url=storage_url, credential=credential)
+    container_client = blob_service.get_container_client(BLOB_CONTAINER)
 
-token_provider = get_bearer_token_provider(
-    credential, "https://azure.com"
-)
-ai_client = OpenAI(
-    base_url=AI_ENDPOINT,
-    api_key=token_provider,
-    max_retries=2,
-)
+    jobs_queue = QueueClient(
+        account_url=queue_url, queue_name=QUEUE_NAME, credential=credential
+    )
+    failed_queue = QueueClient(
+        account_url=queue_url, queue_name=FAILED_QUEUE_NAME, credential=credential
+    )
+
+    cosmos = CosmosClient(url=cosmos_endpoint, credential=credential)
+    db = cosmos.get_database_client(COSMOS_DATABASE)
+    cosmos_container = db.get_container_client(COSMOS_CONTAINER)
+
+    scope = "https://" + "cognitiveservices" + "://"
+    token_provider = get_bearer_token_provider(credential, "https://" + "cognitiveservices" + "." + "azure" + "." + "com" + "/.default")
+    ai_client = OpenAI(
+        base_url=ai_endpoint,
+        api_key=token_provider,
+        max_retries=2,
+    )
+
+    return container_client, jobs_queue, failed_queue, cosmos_container, ai_client
+
 
 app = FastAPI(title="CC Assignment 4 — Document Processing Pipeline")
 
 
-# --------------------------------------------------
-# 3. Models & Helpers
-# --------------------------------------------------
 class DocumentUploadRequest(BaseModel):
     filename: str = Field(..., min_length=1, max_length=255)
     content: str = Field(..., min_length=1)
@@ -85,7 +81,7 @@ def compute_shard_id(document_id: str) -> str:
     return f"shard-{shard_num:02d}"
 
 
-def extract_document_fields(text: str) -> dict:
+def extract_document_fields(ai_client: OpenAI, text: str) -> dict:
     prompt = (
         "Analyze the following document and respond ONLY with a valid JSON object "
         "containing exactly three keys:\n"
@@ -119,9 +115,6 @@ def extract_document_fields(text: str) -> dict:
     }
 
 
-# --------------------------------------------------
-# 4. API Endpoints
-# --------------------------------------------------
 @app.get("/health")
 def health_check():
     return {
@@ -132,6 +125,7 @@ def health_check():
 
 @app.post("/documents")
 def upload_document(payload: DocumentUploadRequest):
+    container_client, jobs_queue, _, _, _ = get_clients()
     document_id = str(uuid4())
     shard_id = compute_shard_id(document_id)
     created_at = datetime.now(timezone.utc).isoformat()
@@ -153,7 +147,7 @@ def upload_document(payload: DocumentUploadRequest):
             "createdAt": created_at,
         }
     )
-    jobs_queue_client.send_message(job_message)
+    jobs_queue.send_message(job_message)
 
     return {
         "id": document_id,
@@ -166,7 +160,8 @@ def upload_document(payload: DocumentUploadRequest):
 
 @app.post("/process-next")
 def process_next_document():
-    messages = list(jobs_queue_client.receive_messages(messages_per_page=1, visibility_timeout=60))
+    container_client, jobs_queue, failed_queue, cosmos_container, ai_client = get_clients()
+    messages = list(jobs_queue.receive_messages(messages_per_page=1, visibility_timeout=60))
     if not messages:
         return {
             "status": "empty",
@@ -183,7 +178,7 @@ def process_next_document():
         blob_client = container_client.get_blob_client(blob_name)
         text_content = blob_client.download_blob().readall().decode("utf-8")
 
-        extracted = extract_document_fields(text_content)
+        extracted = extract_document_fields(ai_client, text_content)
 
         record = {
             "id": document_id,
@@ -197,8 +192,8 @@ def process_next_document():
             "status": "processed",
         }
 
-        cosmos_container_client.upsert_item(body=record)
-        jobs_queue_client.delete_message(msg.id, msg.pop_receipt)
+        cosmos_container.upsert_item(body=record)
+        jobs_queue.delete_message(msg.id, msg.pop_receipt)
 
         return {
             "id": document_id,
@@ -224,29 +219,30 @@ def process_next_document():
 
         logger.warning("AI rate limit hit for %s; delaying retry by %ss", document_id, retry_delay)
         if msg.dequeue_count >= MAX_DEQUEUE_ATTEMPTS:
-            failed_queue_client.send_message(msg.content)
-            jobs_queue_client.delete_message(msg.id, msg.pop_receipt)
+            failed_queue.send_message(msg.content)
+            jobs_queue.delete_message(msg.id, msg.pop_receipt)
             raise HTTPException(status_code=429, detail="Max retries exceeded; moved job to failed-documents queue.")
 
-        jobs_queue_client.update_message(msg.id, msg.pop_receipt, visibility_timeout=retry_delay)
+        jobs_queue.update_message(msg.id, msg.pop_receipt, visibility_timeout=retry_delay)
         raise HTTPException(status_code=429, detail=f"AI rate limit exceeded; retry scheduled in {retry_delay}s.")
 
     except Exception as exc:
         logger.exception("Processing failed for document %s (attempt %s)", document_id, msg.dequeue_count)
         if msg.dequeue_count >= MAX_DEQUEUE_ATTEMPTS:
-            failed_queue_client.send_message(msg.content)
-            jobs_queue_client.delete_message(msg.id, msg.pop_receipt)
+            failed_queue.send_message(msg.content)
+            jobs_queue.delete_message(msg.id, msg.pop_receipt)
             raise HTTPException(status_code=502, detail=f"Processing failed permanently; moved to failed-documents: {exc}")
 
-        jobs_queue_client.update_message(msg.id, msg.pop_receipt, visibility_timeout=15)
+        jobs_queue.update_message(msg.id, msg.pop_receipt, visibility_timeout=15)
         raise HTTPException(status_code=502, detail=f"Temporary processing failure; scheduled retry: {exc}")
 
 
 @app.get("/documents/{document_id}")
 def get_document(document_id: str):
+    _, _, _, cosmos_container, _ = get_clients()
     shard_id = compute_shard_id(document_id)
     try:
-        item = cosmos_container_client.read_item(item=document_id, partition_key=shard_id)
+        item = cosmos_container.read_item(item=document_id, partition_key=shard_id)
         return item
     except CosmosResourceNotFoundError:
         raise HTTPException(status_code=404, detail="Document not found or still processing.")
