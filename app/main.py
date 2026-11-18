@@ -56,13 +56,18 @@ def get_clients():
     db = cosmos.get_database_client(COSMOS_DATABASE)
     cosmos_container = db.get_container_client(COSMOS_CONTAINER)
 
-    scope = "https://" + "cognitiveservices" + "://"
-    token_provider = get_bearer_token_provider(credential, "https://" + "cognitiveservices" + "." + "azure" + "." + "com" + "/.default")
+
+    token_provider = get_bearer_token_provider(
+        credential,
+        "https://ai.azure.com/.default",
+    )
+
     ai_client = OpenAI(
         base_url=ai_endpoint,
         api_key=token_provider,
         max_retries=2,
     )
+
 
     return container_client, jobs_queue, failed_queue, cosmos_container, ai_client
 
@@ -70,9 +75,16 @@ def get_clients():
 app = FastAPI(title="CC Assignment 4 — Document Processing Pipeline")
 
 
+
 class DocumentUploadRequest(BaseModel):
     filename: str = Field(..., min_length=1, max_length=255)
     content: str = Field(..., min_length=1)
+
+
+class ExtractedDocumentFields(BaseModel):
+    category: str
+    summary: str
+    keywords: list[str] = Field(..., min_length=3, max_length=5)
 
 
 def compute_shard_id(document_id: str) -> str:
@@ -106,13 +118,13 @@ def extract_document_fields(ai_client: OpenAI, text: str) -> dict:
 
     raw_output = response.output_text.strip()
     cleaned = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw_output, flags=re.DOTALL).strip()
+
     parsed = json.loads(cleaned)
 
-    return {
-        "category": str(parsed.get("category", "General")),
-        "summary": str(parsed.get("summary", "")),
-        "keywords": list(parsed.get("keywords", [])),
-    }
+    validated = ExtractedDocumentFields.model_validate(parsed)
+
+    return validated.model_dump()
+
 
 
 @app.get("/health")
@@ -226,15 +238,34 @@ def process_next_document():
         jobs_queue.update_message(msg.id, msg.pop_receipt, visibility_timeout=retry_delay)
         raise HTTPException(status_code=429, detail=f"AI rate limit exceeded; retry scheduled in {retry_delay}s.")
 
-    except Exception as exc:
-        logger.exception("Processing failed for document %s (attempt %s)", document_id, msg.dequeue_count)
+
+    except Exception:
+        logger.exception(
+            "Processing failed for document %s (attempt %s)",
+            document_id,
+            msg.dequeue_count,
+        )
+
         if msg.dequeue_count >= MAX_DEQUEUE_ATTEMPTS:
             failed_queue.send_message(msg.content)
             jobs_queue.delete_message(msg.id, msg.pop_receipt)
-            raise HTTPException(status_code=502, detail=f"Processing failed permanently; moved to failed-documents: {exc}")
 
-        jobs_queue.update_message(msg.id, msg.pop_receipt, visibility_timeout=15)
-        raise HTTPException(status_code=502, detail=f"Temporary processing failure; scheduled retry: {exc}")
+            raise HTTPException(
+                status_code=502,
+                detail="Processing failed permanently. The job was moved to the failed-documents queue.",
+            )
+
+        jobs_queue.update_message(
+            msg.id,
+            msg.pop_receipt,
+            visibility_timeout=15,
+        )
+
+        raise HTTPException(
+            status_code=502,
+            detail="Document processing failed. The job has been scheduled for retry.",
+        )
+
 
 
 @app.get("/documents/{document_id}")
