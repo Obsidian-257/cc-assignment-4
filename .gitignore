@@ -1,0 +1,19 @@
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+
+# Environment and secrets
+.env
+.env.*
+!.env.example
+
+# VSCode
+.vscode/
+
+# Test and temporary files
+.pytest_cache/
+.DS_Store
+
+# Deployment packages
+*.zip

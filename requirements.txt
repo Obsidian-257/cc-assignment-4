@@ -1,0 +1,10 @@
+fastapi
+uvicorn[standard]
+gunicorn
+python-multipart
+python-dotenv
+azure-identity
+azure-storage-blob
+azure-storage-queue
+azure-cosmos
+openai
