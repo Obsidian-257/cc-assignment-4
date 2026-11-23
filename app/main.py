@@ -113,42 +113,6 @@ def get_cosmos_container():
     db = cosmos.get_database_client(COSMOS_DATABASE)
     return db.get_container_client(COSMOS_CONTAINER)
 
-    storage_url = os.environ["AZURE_STORAGE_ACCOUNT_URL"]
-    queue_url = os.environ["AZURE_QUEUE_ACCOUNT_URL"]
-    cosmos_endpoint = os.environ["COSMOS_ENDPOINT"]
-    ai_endpoint = os.environ["AI_ENDPOINT"]
-
-    credential = DefaultAzureCredential()
-
-    blob_service = BlobServiceClient(account_url=storage_url, credential=credential)
-    container_client = blob_service.get_container_client(BLOB_CONTAINER)
-
-    jobs_queue = QueueClient(
-        account_url=queue_url, queue_name=QUEUE_NAME, credential=credential
-    )
-    failed_queue = QueueClient(
-        account_url=queue_url, queue_name=FAILED_QUEUE_NAME, credential=credential
-    )
-
-    cosmos = CosmosClient(url=cosmos_endpoint, credential=credential)
-    db = cosmos.get_database_client(COSMOS_DATABASE)
-    cosmos_container = db.get_container_client(COSMOS_CONTAINER)
-
-
-    token_provider = get_bearer_token_provider(
-        credential,
-        "https://ai.azure.com/.default",
-    )
-
-    ai_client = OpenAI(
-        base_url=ai_endpoint,
-        api_key=token_provider,
-        max_retries=2,
-    )
-
-
-    return container_client, jobs_queue, failed_queue, cosmos_container, ai_client
-
 
 app = FastAPI(title="CC Assignment 4 — Document Processing Pipeline")
 
