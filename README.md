@@ -75,12 +75,16 @@ The managed identity is assigned the following data-plane roles:
 - `Cognitive Services OpenAI User`
 - `Cosmos DB Built-in Data Contributor`
 
+The managed identity evidence screenshot (evidence/06-managed-identity.png) shows the Storage Blob Data Contributor, Storage Queue Data Contributor, and Cognitive Services OpenAI User assignments. The Cosmos DB role is a separate data-plane assignment and is not displayed in that screenshot.
+
 The application does not store storage account keys, Cosmos DB keys, or AI API keys in its source code. The `.env` file contains resource endpoints and configuration values, not credentials.
 
 For the OpenAI v1 endpoint, the token provider requests the `https://ai.azure.com/.default` scope.
 
+
 ### Storage Access Tier (`Hot`)
-The Blob Storage account and uploaded document blobs explicitly use the **`Hot` access tier**. Newly uploaded documents are read immediately by the processing worker (`POST /process-next`), making frequent initial access guaranteed. While `Cool` or `Cold` tiers offer lower per-GB storage rates, they carry higher read operation costs and a 30-day (`Cool`) or 90-day (`Cold`) minimum retention penalty—making `Hot` the most cost-effective tier for active ingestion pipelines (with lifecycle management rules suitable for moving aged documents to `Cool` after 30 days). The Hot tier was selected because uploaded documents are read shortly after ingestion. Cool or Cold tiers may reduce storage costs for infrequently accessed data, but introduce additional access costs and minimum-retention considerations. A lifecycle management policy could be introduced in a future production version to move older documents to a cooler tier.
+
+The Blob Storage account and uploaded document blobs explicitly use the **`Hot` access tier**. Newly uploaded documents are read shortly after ingestion by the processing worker (`POST /process-next`). The Hot tier is therefore appropriate for this workload because it supports frequent access without the higher read-operation costs associated with cooler tiers. A lifecycle management policy could be introduced in a future production version to move older documents to a cooler tier when they are no longer frequently accessed.
 
 ### AI Rate Limits, Latency & Failure Handling
 * **Latency decoupling**: `POST /documents` returns immediately after persisting the blob and enqueueing a lightweight job message, isolating upload clients from multi-second LLM inference latency.
